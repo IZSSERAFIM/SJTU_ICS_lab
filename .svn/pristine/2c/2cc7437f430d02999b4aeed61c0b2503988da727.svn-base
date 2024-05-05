@@ -1,0 +1,289 @@
+/*
+ * mm-naive.c - The fastest, least memory-efficient malloc package.
+ * 
+ * In this naive approach, a block is allocated by simply incrementing
+ * the brk pointer.  A block is pure payload. There are no headers or
+ * footers.  Blocks are never coalesced or reused. Realloc is
+ * implemented directly using mm_malloc and mm_free.
+ *
+ * NOTE TO STUDENTS: Replace this header comment with your own header
+ * comment that gives a high level description of your solution.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <unistd.h>
+#include <string.h>
+
+#include "mm.h"
+#include "memlib.h"
+
+/* single word (4) or double word (8) alignment */
+#define ALIGNMENT 8
+
+/* rounds up to the nearest multiple of ALIGNMENT */
+#define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
+
+
+#define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
+
+//定义了头部和脚部的大小为4字节
+#define WSIZE 4
+//定义了双字（double word）的大小为8字节
+#define DSIZE 8
+//定义了当需要扩展堆时，默认分配的内存块大小。(1 << 12) 等于 4096 字节（或4KB）
+#define CHUNKSIZE (1 << 12)
+//定义了一个宏，用于将块的大小和分配位打包到一个整数中
+#define PACK(size, alloc) ((size) | (alloc))
+//GET 宏用于从给定的指针位置读取一个无符号整数
+#define GET(p) (*(unsigned int *)(p))
+//PUT 宏用于向给定的指针位置写入一个无符号整数
+#define PUT(p, val) ((*(unsigned int *)(p)) = (val))
+//GET_SIZE 宏从头部或脚部提取块的大小
+#define GET_SIZE(p) (GET(p) & ~0x7)
+//GET_ALLOC 宏提取分配位，该位表示块是否已分配
+#define GET_ALLOC(p) (GET(p) & 0x1)
+//HDRP 宏返回给定有效载荷指针的头部位置
+#define HDRP(bp) ((char*)(bp) - WSIZE)
+//TRP 宏返回给定有效载荷指针的脚部位置
+#define FTRP(bp) ((char*)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
+//NEXT_BLKP 宏返回给定有效载荷指针的下一个块的有效位起始位置
+#define NEXT_BLKP(bp) ((char*)(bp) + GET_SIZE(((char*)(bp) - WSIZE)))
+//PREV_BLKP 宏返回给定有效载荷指针的前一个块的有效位起始位置
+#define PREV_BLKP(bp) ((char*)(bp) - GET_SIZE(((char*)(bp) - DSIZE)))
+
+//总是指向序言块的第二块
+static char *heap_list;
+//扩展堆
+static void *extend_heap(size_t words);
+//合并空闲块
+static void *coalesce(void *bp);
+//首次适配
+static void *find_fit(size_t asize);
+//分割空闲块
+static void place(void *bp, size_t asize);
+/* 
+ * mm_init - initialize the malloc package.
+ */
+int mm_init(void)
+{
+    //使用 mem_sbrk 函数申请 4*WSIZE 字节的空间。如果申请失败（返回 (void *)-1），则函数返回 -1
+    if((heap_list = mem_sbrk(4*WSIZE)) == (void *)-1)
+        return -1;
+    //使用 PUT 宏将 heap_list 所指向的4*WSIZE 字节位置设置为0，确保内存块的对齐
+    PUT(heap_list, 0);
+    //使用 PUT 宏将 heap_list 所指向的4*WSIZE 字节位置设置为 DSIZE，表示第一个序言块的大小
+    PUT(heap_list + (1*WSIZE), PACK(DSIZE, 1));
+    //使用 PUT 宏将 heap_list 所指向的4*WSIZE 字节位置设置为 DSIZE，表示第二个序言块的大小
+    PUT(heap_list + (2*WSIZE), PACK(DSIZE, 1));
+    //使用 PUT 宏将 heap_list 所指向的4*WSIZE 字节位置设置为0，表示结尾块    
+    PUT(heap_list + (3*WSIZE), PACK(0, 1));
+    //将 heap_list 指针移动到第二个序言块之后，这样第一个序言块和可能的空闲空间就被跳过了
+    heap_list += (2*WSIZE);
+    //使用 extend_heap 函数扩展堆的大小。扩展的大小是 CHUNKSIZE/WSIZE。如果扩展失败，则返回 -1
+    if(extend_heap(CHUNKSIZE/WSIZE) == NULL)
+        return -1;
+    return 0;
+}
+
+void *extend_heap(size_t words)
+{
+    //指向新分配的内存块的有效载荷的起始位置
+    char *bp;
+    //计算实际需要分配的大小，考虑了对齐问题
+    size_t size;
+    //检查 words 是否是偶数。如果是奇数，则增加1，确保 size 是 WSIZE 的倍数，从而实现对齐
+    size = (words % 2) ? (words+1) * WSIZE : words * WSIZE;
+
+    //使用 mem_sbrk 函数分配 size 字节的内存。如果分配失败（返回 -1），则函数返回 NULL
+    if((long)(bp = mem_sbrk(size)) == -1)
+        return NULL;
+    
+    //设置头部和脚部
+    //设置新分配的内存块的头部
+    PUT(HDRP(bp), PACK(size, 0));
+    //设置新分配的内存块的脚部
+    PUT(FTRP(bp), PACK(size, 0));
+    //设置结尾块
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));
+
+    //调用 coalesce 函数来检查新分配的内存块是否与相邻的空闲块相邻，并尝试合并它们。如果合并成功，coalesce 函数可能返回合并后的空闲块的地址；否则，返回原始地址
+    return coalesce(bp);
+}
+
+void *coalesce(void *bp)
+{
+    //获取前一个块和后一个块的分配位
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+    //获取当前块的大小
+    size_t size = GET_SIZE(HDRP(bp));
+
+    //根据前一个块和后一个块的分配位的不同情况，进行不同的合并操作
+    //如果前一个块和后一个块都已分配，则不需要合并
+    if(prev_alloc && next_alloc){
+        return bp;
+    }
+    //如果前一个块已分配，后一个块未分配，则将当前块与后一个块合并
+    else if(prev_alloc && !next_alloc){
+        //获取后一个块的大小并加到当前块的大小上
+        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        //设置当前块的头部和脚部
+        PUT(HDRP(bp), PACK(size, 0));
+        PUT(FTRP(bp), PACK(size, 0));
+    }
+    //如果前一个块未分配，后一个块已分配，则将前一个块与当前块合并
+    else if(!prev_alloc && next_alloc){
+        //获取前一个块的大小并加到当前块的大小上
+        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+        //设置前一个块的头部和脚部
+        PUT(FTRP(bp), PACK(size, 0));
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+        //将当前块的指针指向前一个块
+        bp = PREV_BLKP(bp);
+    }
+    //如果前一个块和后一个块都未分配，则将前一个块、当前块和后一个块合并
+    else{
+        //获取前一个块和后一个块的大小并加到当前块的大小上
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
+        //设置前一个块的头部和脚部
+        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+        //将当前块的指针指向前一个块
+        bp = PREV_BLKP(bp);
+    }
+    return bp;
+}
+
+/* 
+ * mm_malloc - Allocate a block by incrementing the brk pointer.
+ *     Always allocate a block whose size is a multiple of the alignment.
+ */
+void *mm_malloc(size_t size)
+{
+    //需要分配的块的大小
+    size_t asize;
+    //需要扩展的堆的大小
+    size_t extendsize;
+    char *bp;
+    if(size == 0)
+        return NULL;
+    //调整块的大小，考虑对齐和块的头部和脚部
+    //如果请求的大小小于等于 DSIZE，则将块的大小设置为 2*DSIZE
+    if(size <= DSIZE)
+        asize = DSIZE + DSIZE;
+    else//否则，将块的大小设置为 2*DSIZE 的倍数
+        asize = DSIZE * ((size + (DSIZE) + (DSIZE-1)) / DSIZE);
+    //首次适配
+    if((bp = find_fit(asize)) != NULL){
+        place(bp, asize);
+        return bp;
+    }
+    //如果没有合适的空闲块，则扩展堆
+    extendsize = asize >= CHUNKSIZE ? asize : CHUNKSIZE;
+    if((bp = extend_heap(extendsize/WSIZE)) == NULL)
+        return NULL;
+    //分配新的空闲块    
+    place(bp, asize);
+    return bp;
+}
+
+void *find_fit(size_t asize)
+{
+    void *bp;
+    //遍历整个堆，查找合适的空闲块
+    for(bp = heap_list; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
+        //如果当前块的大小大于等于需要分配的块的大小，并且当前块未分配，则返回当前块的指针
+        if((GET_SIZE(HDRP(bp)) >= asize) && (!GET_ALLOC(HDRP(bp)))){
+            return bp;
+        }
+    }
+    return NULL;
+}
+
+void place(void *bp, size_t asize)
+{
+    //获取当前块的大小
+    size_t csize = GET_SIZE(HDRP(bp));
+    //如果当前块的大小减去分配的大小后大于等于16，则将当前块切割
+    if((csize - asize) >= 2*DSIZE) {
+        //设置头部
+        PUT(HDRP(bp), PACK(asize, 1));
+        //设置脚部
+        PUT(FTRP(bp), PACK(asize, 1));
+        //设置下一个块
+        bp = NEXT_BLKP(bp);
+        //设置头部
+        PUT(HDRP(bp), PACK(csize - asize, 0));
+        //设置脚部
+        PUT(FTRP(bp), PACK(csize - asize, 0));
+    }
+    //如果当前块的大小等于需要分配的块的大小，则将当前块分配
+    else{
+        //设置头部
+        PUT(HDRP(bp), PACK(csize, 1));
+        //设置脚部
+        PUT(FTRP(bp), PACK(csize, 1));
+    }
+}
+
+/*
+ * mm_free - Freeing a block does nothing.
+ */
+void mm_free(void *ptr)
+{
+    //将有效载荷指针转换为块指针
+    if(ptr==0)
+        return;
+    //释放块    
+    size_t size = GET_SIZE(HDRP(ptr));
+    //设置分配位为0
+    PUT(HDRP(ptr), PACK(size, 0));
+    //设置脚部
+    PUT(FTRP(ptr), PACK(size, 0));
+    //调用 coalesce 函数来检查新释放的内存块是否与相邻的空闲块相邻，并尝试合并它们。如果合并成功，coalesce 函数可能返回合并后的空闲块的地址；否则，返回原始地址
+    coalesce(ptr);
+}
+
+/*
+ * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
+ */
+void *mm_realloc(void *ptr, size_t size)
+{
+    if (size == 0){
+        mm_free(ptr);
+        return 0;
+    }
+    if(ptr == NULL)
+        return mm_malloc(size);
+    //于存储新分配的内存块的地址
+    void *newptr;
+    //用于存储需要复制的字节数
+    size_t copysize;
+    //分配大小为 size 的新内存块。如果分配失败（返回 NULL），则 mm_realloc 也返回 NULL
+    if((newptr = mm_malloc(size))==NULL)
+        return NULL;
+    //使用 GET_SIZE 宏从原内存块的头部（HDRP(ptr)）提取大小信息，并存储在 copysize 中
+    copysize = GET_SIZE(HDRP(ptr));
+    //如果请求的新大小 size 小于原内存块的大小，那么只需要复制 size 大小的数据到新内存块。否则，复制整个原内存块的内容
+    if(size < copysize)
+        copysize = size;
+    //使用 memcpy 函数将原内存块的前 copysize 字节内容复制到新分配的内存块中
+    memcpy(newptr, ptr, copysize);
+    mm_free(ptr);
+    return newptr;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,132 @@
+# 李若彬 522031910747
+# use iaddq to dwindle the use and modify of registers
+# test how much elements to handle in one time could get the lowest CPE => 6 elements a time
+# handle 6 elements once a time, so reduce len by 6 every time
+# use Rest to handle the rest elements
+
+#/* $begin ncopy-ys */
+##################################################################
+# ncopy.ys - Copy a src block of len words to dst.
+# Return the number of positive words (>0) contained in src.
+#
+# Include your name and ID here.
+#
+# Describe how and why you modified the baseline code.
+#
+##################################################################
+# Do not modify this portion
+# Function prologue.
+# %rdi = src, %rsi = dst, %rdx = len
+ncopy:
+
+##################################################################
+# You can modify this portion
+	# Loop header
+	iaddq  $-6, %rdx		# handle 6 elements once a time
+	jl Rest					# handle the rest elements( <6 )
+
+Loop:	
+	mrmovq (%rdi), %r10		# read val(src[i]) from src...
+	mrmovq 8(%rdi), %r11    # read next val(src[i+1]) from src...
+	rmmovq %r10, (%rsi)		# ...and store it(src[i]) to dst[i]
+	andq %r10, %r10			# val(src[i]) <= 0?
+	jle Npos				# if so, goto Npos:
+	iaddq $1, %rax			# count++
+
+Npos:	
+	rmmovq %r11, 8(%rsi)    # store src[i+1] to dst[i+1]
+	andq   %r11, %r11       # src[i+1] <= 0?
+	jle    Npos1			# if so, goto Npos1:
+	iaddq  $1, %rax         # count++
+
+Npos1: 
+	mrmovq 16(%rdi), %r10   # src[i+2] to %r10
+	mrmovq 24(%rdi), %r11   # src[i+3] to %r11
+	rmmovq %r10, 16(%rsi)   # store src[i+2] to dst[i+2]
+	andq   %r10, %r10       # src[i+2] <= 0? 
+	jle    Npos2            # if so, goto Npos2:
+	iaddq  $1, %rax         # count ++
+
+Npos2: 
+	rmmovq %r11, 24(%rsi)   # store src[i+3] to dst[i+3]
+	andq   %r11, %r11       # src[i+3] <= 0? 
+	jle    Npos3            # if so, goto Npos3:
+	iaddq  $1, %rax         # count++ 
+
+Npos3: 
+	mrmovq 32(%rdi), %r10   # src[i+4] to %r10
+	mrmovq 40(%rdi), %r11   # src[i+5] to %r11
+	rmmovq %r10, 32(%rsi)   # store src[i+4] to dst[i+4]
+	andq   %r10, %r10       # src[i+4] <= 0?
+	jle    Npos4            # if so, goto Npos4:
+	iaddq  $1, %rax         # count++
+
+Npos4: 
+	rmmovq %r11, 40(%rsi)   # store src[i+5] to dst[i+5]
+	andq   %r11, %r11       # src[i+5] <= 0?
+	jle    Init         	# if so, goto Init:
+	iaddq  $1, %rax         # count++
+
+Init: 
+	iaddq $48, %rdi         # set next start at src[i+6]
+	iaddq $48, %rsi         # set next start at dst[i+6]
+	iaddq $-6, %rdx         # len -= 6
+	jge   Loop              # handle the next 6 elements
+
+Rest:
+	iaddq $6, %rdx          # len +=6 (reset len to the state before -6)
+
+Rest1:
+	iaddq  $-1, %rdx        # len--
+	jl     Done             # have handled all elements
+	mrmovq (%rdi), %r10     # read val(src[i]) from src...
+	mrmovq 8(%rdi), %r11    # read next val(src[i+1]) from src...
+	rmmovq %r10, (%rsi)     # ...and store it(src[i]) to dst[i]
+	andq   %r10, %r10       # val(src[i]) <= 0?
+	jle    Rest2          	# if so, goto Rest2:
+	iaddq  $1, %rax         # count++	
+
+Rest2: 
+	iaddq  $-1, %rdx        # len-- 
+	jl     Done             # have handled all elements
+	rmmovq %r11, 8(%rsi)    # store src[i+1] to dst[i+1]
+	andq   %r11, %r11       # src[i+1] <= 0?
+	jle    Rest3           	# if so, go to Rest3:
+	iaddq  $1, %rax         # count++ 
+
+Rest3: 
+	iaddq  $-1, %rdx        # len-- 
+	jl     Done             # have handled all elements
+	mrmovq 16(%rdi), %r10   # src[i+2] to %r10 
+	mrmovq 24(%rdi), %r11   # src[i+3] to %r11
+	rmmovq %r10, 16(%rsi)   # store src[i+2] to dst[i+2] 
+	andq   %r10, %r10       # src[i+2] <= 0? 
+	jle    Rest4           	# if so, goto Rest4
+	iaddq  $1, %rax         # count++
+
+Rest4: 
+	iaddq  $-1, %rdx        # len--
+	jl     Done	        	# have handled all elements
+	rmmovq %r11, 24(%rsi)   # store src[i+3] to dst[i+3]
+	andq   %r11, %r11       # src[i+3] <= 0? 
+	jle    Rest5           	# if so, goto Rest5 
+	iaddq  $1, %rax 
+
+Rest5: 
+	iaddq  $-1, %rdx        # len--
+	jl     Done             # have handled all elements 
+	mrmovq 32(%rdi), %r10   # src[i+4] to %r10 
+	rmmovq %r10, 32(%rsi)   # store src[i+4] to dst[i+4] 
+	andq   %r10, %r10       # src[i+4] <= 0? 
+	jle    Done             # if so, have handled all elements
+	iaddq  $1, %rax         # count++
+
+##################################################################
+# Do not modify the following section of code
+# Function epilogue.
+Done:
+	ret
+##################################################################
+# Keep the following label at the end of your function
+End:
+#/* $end ncopy-ys */

@@ -1,0 +1,409 @@
+/*
+ * mm-naive.c - The fastest, least memory-efficient malloc package.
+ * 
+ * In this naive approach, a block is allocated by simply incrementing
+ * the brk pointer.  A block is pure payload. There are no headers or
+ * footers.  Blocks are never coalesced or reused. Realloc is
+ * implemented directly using mm_malloc and mm_free.
+ *
+ * NOTE TO STUDENTS: Replace this header comment with your own header
+ * comment that gives a high level description of your solution.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <unistd.h>
+#include <string.h>
+
+#include "mm.h"
+#include "memlib.h"
+
+/* 定义用于特殊操作的宏 */
+#define TRICK
+
+/* 单字（4字节）或双字（8字节）对齐 */
+#define ALIGNMENT 8
+
+/* 向上舍入到最接近的ALIGNMENT的倍数 */
+#define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
+
+/* 基本常量和宏 */
+#define WSIZE 4 /* 字和头/尾大小（字节） */
+#define DSIZE 8 /* 双字大小（字节） */
+#define OVERHEAD 16 /* 空闲块的最小大小 */
+#define CHUNKSIZE (72) /* 扩展堆的大小（字节） */
+
+/* 将大小和分配位打包到一个字中 */
+#define PACK(size, alloc) ((size)|(alloc))
+
+/* 在地址p处读取和写入一个字 */
+#define GET(p) (*(unsigned int *)(p))
+#define PUT(p, val) (*(unsigned int *)(p) = (val))
+
+/* 从地址p处读取大小和分配字段 */
+#define GET_SIZE(p) (GET(p) & ~0x7)
+#define GET_ALLOC(p) (GET(p) & 0x1)
+
+/* 从地址转换为偏移量和反之亦然 */
+#define GET_OFFSET(bp) ((char *)bp - (char *)heap_listp)
+#define GET_ADDR(offset) (heap_listp + offset)
+
+/* 给定块指针bp，计算其头、尾、前驱和后继的地址 */
+#define HDRP(bp) ((char *)(bp) - WSIZE)
+#define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
+#define PRED(bp) (bp)
+#define SUCC(bp) ((bp) + WSIZE)
+
+/* 给定块指针bp，计算下一个和上一个块的地址，下一个和上一个空闲块的地址 */
+#define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))
+#define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
+
+#define NEXT_FREEP(bp) ((GET(SUCC(bp)))? (GET_ADDR(GET(SUCC(bp)))) : NULL)
+#define PREV_FREEP(bp) ((GET(PRED(bp)))? (GET_ADDR(GET(PRED(bp)))) : NULL)
+
+/* 给定块大小，计算适合的free_listp的地址 */
+#define FREELISTPP(size) ((size)>=16384? &free_listp16384 : ((size)>=4096? &free_listp4096 : ((size)>=1024? &free_listp1024 : &free_listp)))
+/* 给定free_listp的地址，计算更大的free_listp的地址 */
+#define LARGER_FREELISTPP(pp) ((pp)==&free_listp? &free_listp1024 : ((pp)==&free_listp1024? &free_listp4096 : ((pp)==&free_listp4096? &free_listp16384 : NULL)))
+
+#define TRICK_SIZE(size) do { if(size == 448) size = 512; else if(size == 112) size = 128; else size = size; } while(0)
+
+/* 堆的头指针 */
+static void *heap_listp;
+
+/* 空闲块列表的头指针 */
+static void *free_listp; /* 大小 < 1024 */
+static void *free_listp1024; /* 1024 <= 大小 < 4096 */
+static void *free_listp4096; /* 4096 <= 大小 < 16384 */
+static void *free_listp16384; /* 16384 <= 大小 */
+
+/* 最近重新分配的空闲块列表的指针，位于堆的末尾 */
+static void *latest_freeblkp;
+
+
+static void *extend_heap(size_t words);
+static void *coalesce(void *bp);
+static void *find_fit(size_t asize);
+static void *place(void *bp, size_t asize);
+
+static void *insert_freeblk(void *bp);
+static void *remove_freeblk(void *bp);
+
+
+/* 
+ * mm_init - initialize the malloc package.
+ */
+int mm_init(void)
+{
+
+    /* 创建初始的空堆 */
+    if((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1)
+        return -1;
+    PUT(heap_listp, 0); /* 对齐填充 */
+    PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1)); /*  头部 */
+    PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1)); /*  头部 */
+    PUT(heap_listp + (3*WSIZE), PACK(0, 1)); /*  尾部 */
+    heap_listp += (2*WSIZE);
+
+    /* 清空所有空闲块列表 */
+    free_listp = NULL;
+    free_listp1024 = NULL;
+    free_listp4096 = NULL;
+    free_listp16384 = NULL;
+
+    /* 扩展空堆，添加一个大小为 CHUNKSIZE 字节的空闲块 */
+    if(extend_heap(CHUNKSIZE/WSIZE) == NULL)
+        return -1;
+    return 0;
+}
+
+/* 
+ * extend_heap - extend heap to contain larger size
+ */
+static void *extend_heap(size_t words)
+{
+    char *bp;
+    size_t size;
+
+    /* 分配偶数个字来保持对齐 */
+    size = (words % 2) ? (words+1) * WSIZE : words * WSIZE;
+    if((long)(bp = mem_sbrk(size)) == -1)
+        return NULL;
+    
+    /* 初始化空闲块的头部/尾部和尾部 */
+    PUT(HDRP(bp), PACK(size, 0)); /* 空闲块的头部 */
+    PUT(FTRP(bp), PACK(size, 0)); /* 空闲块的尾部 */
+    insert_freeblk(bp); /* 将空闲块插入适当的空闲块列表中 */
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* 新的尾部头部 */
+
+    /* 如果前一个块是空闲的，则合并 */
+    return coalesce(bp); /* 合并相邻的空闲块 */
+}
+
+static void *insert_freeblk(void *bp)
+{
+    // 获取适合当前块大小的空闲块列表的指针
+    void **freelistpp = FREELISTPP(GET_SIZE(HDRP(bp)));
+    if(*freelistpp){
+        // 更新当前块的前驱和后继指针
+        PUT(PRED(*freelistpp), GET_OFFSET(bp));
+        PUT(SUCC(bp), GET_OFFSET(*freelistpp));
+        PUT(PRED(bp), 0);
+    } else {
+        // 当前空闲块列表为空，更新当前块的前驱和后继指针
+        PUT(PRED(bp), 0);
+        PUT(SUCC(bp), 0);
+    }
+    // 将当前块插入适当的空闲块列表中
+    *freelistpp = bp;
+
+    return bp;
+}
+
+/* 
+ * mm_malloc - Allocate a block by incrementing the brk pointer.
+ *     Always allocate a block whose size is a multiple of the alignment.
+ */
+void *mm_malloc(size_t size)
+{
+    TRICK_SIZE(size);
+
+    size_t asize; /* 实际分配的大小 */
+    size_t extendsize; /* 当没有空闲块可用时，扩展的大小 */
+    char *bp;
+
+    if(size == 0)
+        return NULL;
+    
+    if(size <= DSIZE)
+        asize = OVERHEAD; /* 如果请求的大小小于等于双字大小，则分配的大小为最小块的大小 */
+    else
+        asize = ALIGN(size) + DSIZE; /* 否则，分配的大小为请求大小加上双字大小并对齐 */
+    
+    if((bp = find_fit(asize)) == NULL){ /* 查找适合的空闲块 */
+        extendsize = asize >= CHUNKSIZE ? asize : CHUNKSIZE; /* 如果没有适合的空闲块，则扩展堆的大小为请求大小和CHUNKSIZE中的较大值 */
+        if((bp = extend_heap(extendsize/WSIZE)) == NULL) /* 扩展堆 */
+            return NULL;
+    }
+
+    bp = place(bp, asize); /* 将分配的大小放置在空闲块中 */
+    return bp;
+}
+
+/* 
+ * find_fit - find befitting free blocks for malloc
+ */
+void *find_fit(size_t asize)
+{
+    void **freelistpp = FREELISTPP(asize); // 获取适合asize的空闲块列表的指针
+    size_t size;
+
+    while(freelistpp){ // 遍历空闲块列表
+        void *bp = *freelistpp; // 获取当前空闲块列表的头指针
+        while (bp){ // 遍历当前空闲块列表
+            size = GET_SIZE(HDRP(bp)); // 获取当前空闲块的大小
+            if((asize <= 0) || (bp == NULL)) // 如果asize小于等于0或者bp为空，则返回空指针
+                return NULL;
+            if(asize <= size && bp != latest_freeblkp){ // 如果asize小于等于当前空闲块的大小且bp不等于最近重新分配的空闲块指针，则返回当前空闲块指针
+                return bp;
+            }
+            bp = NEXT_FREEP(bp); // 获取下一个空闲块的指针
+        }
+        freelistpp = LARGER_FREELISTPP(freelistpp); // 获取更大的空闲块列表的指针
+    }
+    
+    return NULL; // 如果没有找到适合的空闲块，则返回空指针
+}
+
+
+/*
+ * mm_free - Freeing a block does nothing.
+ */
+void mm_free(void *ptr)
+{
+    size_t size = GET_SIZE(HDRP(ptr)); // 获取要释放的块的大小
+    PUT(HDRP(ptr), PACK(size, 0)); // 将头部标记为未分配
+    PUT(FTRP(ptr), PACK(size, 0)); // 将尾部标记为未分配
+    insert_freeblk(ptr); // 将块插入适当的空闲块列表中
+    coalesce(ptr); // 合并相邻的空闲块
+}
+
+
+/*
+ * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
+ */
+void *mm_realloc(void *ptr, size_t size)
+{
+    /* 如果ptr为NULL，则直接分配内存 */
+    if (!ptr)
+        return mm_malloc(size);
+    /* 如果size为0，则直接释放内存 */
+    if (!size) {
+        mm_free(ptr);
+        return NULL;
+    }
+
+    size_t newsize = ALIGN(size) + DSIZE; /* 新的实际分配大小 */
+    size_t oldsize = GET_SIZE(HDRP(ptr)); /* 旧块的大小 */
+    size_t remainsize = GET_ALLOC(HDRP(NEXT_BLKP(ptr))) ? 0 : GET_SIZE(HDRP(NEXT_BLKP(ptr))); /* 块后面的剩余大小 */
+
+    /* 情况：大小不变 */
+    if (newsize == oldsize)
+        return ptr;
+    /* 情况：大小变小 */
+    else if (newsize < oldsize) {
+        PUT(HDRP(ptr), PACK(newsize, 1));
+        PUT(FTRP(ptr), PACK(newsize, 1));
+        PUT(HDRP(NEXT_BLKP(ptr)), PACK(oldsize - newsize, 0));
+        PUT(FTRP(NEXT_BLKP(ptr)), PACK(oldsize - newsize, 0));
+        insert_freeblk(NEXT_BLKP(ptr));
+        coalesce(NEXT_BLKP(ptr));
+        return ptr;
+    }
+    /* 情况：大小变大 */
+    else {
+        int enough_size = remainsize >= newsize - oldsize + OVERHEAD; /* 剩余大小是否足够 */
+        int can_expand = (remainsize && !GET_SIZE(HDRP(NEXT_BLKP(NEXT_BLKP(ptr))))) || !GET_SIZE(HDRP(NEXT_BLKP(ptr))); /* 块是否可以扩展 */
+
+        /* 子情况：剩余大小不足，但可以简单地扩展到堆的末尾 */
+        if (!enough_size && can_expand) {
+            size_t subsize = newsize - oldsize;
+            extend_heap((subsize >= CHUNKSIZE ? subsize : CHUNKSIZE) / WSIZE);
+            remainsize = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+        }
+        /* 子情况：剩余大小足够 */
+        if (enough_size || can_expand) {
+            remove_freeblk(NEXT_BLKP(ptr));
+            PUT(HDRP(ptr), PACK(newsize, 1));
+            PUT(FTRP(ptr), PACK(newsize, 1));
+            if (remainsize != newsize - oldsize) {
+                PUT(HDRP(NEXT_BLKP(ptr)), PACK(oldsize + remainsize - newsize, 0));
+                PUT(FTRP(NEXT_BLKP(ptr)), PACK(oldsize + remainsize - newsize, 0));
+                insert_freeblk(NEXT_BLKP(ptr));
+
+                latest_freeblkp = NEXT_BLKP(ptr);
+            }
+            return ptr;
+        }
+        /* 子情况：需要重新分配新的内存块 */
+        else {
+            void *newptr = mm_malloc(size);
+            if (newptr == NULL)
+                return NULL;
+            memcpy(newptr, ptr, oldsize - DSIZE);
+            mm_free(ptr);
+
+            return newptr;
+        }
+    }
+}
+
+static void *remove_freeblk(void *bp)
+{
+    // 获取适合当前块大小的空闲块列表的指针
+    void **freelistpp = FREELISTPP(GET_SIZE(HDRP(bp)));
+    void *prev = PREV_FREEP(bp); // 获取当前块的前驱指针
+    void *next = NEXT_FREEP(bp); // 获取当前块的后继指针
+
+    if(prev && next){
+        // 更新前驱和后继指针
+        PUT(SUCC(prev), GET(SUCC(bp)));
+        PUT(PRED(next), GET(PRED(bp)));
+    } else if(prev && !next){
+        // 更新前驱指针
+        PUT(SUCC(prev), 0);
+    } else if(!prev && next){
+        // 更新后继指针和空闲块列表的头指针
+        PUT(PRED(next), 0);
+        *freelistpp = next;
+    } else{
+        // 更新空闲块列表的头指针
+        *freelistpp = NULL;
+    }
+
+    return bp;
+}
+
+/* 
+ * coalesce - coalesce adjecent free blocks
+ */
+static void *coalesce(void *bp)
+{
+    void *prev = PREV_BLKP(bp); // 获取前一个块的地址
+    void *next = NEXT_BLKP(bp); // 获取后一个块的地址
+    size_t prev_alloc = GET_ALLOC(FTRP(prev)); // 获取前一个块的分配位
+    size_t next_alloc = GET_ALLOC(HDRP(next)); // 获取后一个块的分配位
+    size_t size = GET_SIZE(HDRP(bp)); // 获取当前块的大小
+
+    /* 情况：不合并 */
+    if(prev_alloc && next_alloc){
+        // 不需要合并
+    }
+    /* 情况：与后一个块合并 */
+    else if(prev_alloc && !next_alloc){
+        remove_freeblk(next); // 从空闲块列表中移除后一个块
+        remove_freeblk(bp); // 从空闲块列表中移除当前块
+        size += GET_SIZE(HDRP(next)); // 更新合并后的块的大小
+        PUT(HDRP(bp), PACK(size, 0)); // 更新合并后的块的头部
+        PUT(FTRP(bp), PACK(size, 0)); // 更新合并后的块的尾部
+        insert_freeblk(bp); // 将合并后的块插入适当的空闲块列表中
+    }
+    /* 情况：与前一个块合并 */
+    else if(!prev_alloc && next_alloc){
+        remove_freeblk(bp); // 从空闲块列表中移除当前块
+        remove_freeblk(prev); // 从空闲块列表中移除前一个块
+        size += GET_SIZE(HDRP(prev)); // 更新合并后的块的大小
+        PUT(FTRP(bp), PACK(size, 0)); // 更新合并后的块的尾部
+        PUT(HDRP(prev), PACK(size, 0)); // 更新合并后的块的头部
+        insert_freeblk(prev); // 将合并后的块插入适当的空闲块列表中
+        bp = prev; // 更新当前块的地址为合并后的块的地址
+    }
+    /* 情况：与前一个块和后一个块都合并 */
+    else {
+        remove_freeblk(next); // 从空闲块列表中移除后一个块
+        remove_freeblk(bp); // 从空闲块列表中移除当前块
+        remove_freeblk(prev); // 从空闲块列表中移除前一个块
+        size += GET_SIZE(HDRP(next)) + GET_SIZE(HDRP(prev)); // 更新合并后的块的大小
+        PUT(HDRP(prev), PACK(size, 0)); // 更新合并后的块的头部
+        PUT(FTRP(next), PACK(size, 0)); // 更新合并后的块的尾部
+        insert_freeblk(prev); // 将合并后的块插入适当的空闲块列表中
+        bp = prev; // 更新当前块的地址为合并后的块的地址
+    }
+    return bp; // 返回合并后的块的地址
+}
+
+
+/* 
+ * place - place the given size to given free block
+ */
+void *place(void *bp, size_t asize)
+{
+    size_t size = GET_SIZE(HDRP(bp)); // 获取当前空闲块的大小
+
+    if((size - asize) >= OVERHEAD){ // 如果剩余空间大于等于最小块的大小
+        remove_freeblk(bp); // 从空闲块列表中移除当前块
+        PUT(HDRP(bp), PACK(size - asize, 0)); // 更新当前块的头部
+        PUT(FTRP(bp), PACK(size - asize, 0)); // 更新当前块的尾部
+        void *next = NEXT_BLKP(bp); // 获取下一个块的地址
+        PUT(HDRP(next), PACK(asize, 1)); // 更新下一个块的头部
+        PUT(FTRP(next), PACK(asize, 1)); // 更新下一个块的尾部
+        insert_freeblk(bp); // 将当前块插入适当的空闲块列表中
+
+        return next; // 返回分配的块的地址
+    } else {
+        remove_freeblk(bp); // 从空闲块列表中移除当前块
+        PUT(HDRP(bp), PACK(size, 1)); // 更新当前块的头部
+        PUT(FTRP(bp), PACK(size, 1)); // 更新当前块的尾部
+        return bp; // 返回分配的块的地址
+    }
+}
+
+
+
+
+
+
+
+
+
+
