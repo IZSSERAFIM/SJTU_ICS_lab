@@ -69,23 +69,6 @@
 
 #define TRICK_CHUNKSIZE(val) ((val >= 72) ? val : 72)
 
-#define SET_BLOCK(ptr, size, alloc) \
-    do { \
-        PUT(HDRP(ptr), PACK(size, alloc)); \
-        PUT(FTRP(ptr), PACK(size, alloc)); \
-    } while (0)
-
-#define CAN_EXPAND(ptr, expsize) \
-    ((GET_SIZE(HDRP(NEXT_BLKP(ptr))) >= expsize + OVERHEAD) || \
-    (GET_SIZE(HDRP(NEXT_BLKP(ptr))) && !GET_SIZE(HDRP(NEXT_BLKP(NEXT_BLKP(ptr))))) || \
-    !GET_SIZE(HDRP(NEXT_BLKP(ptr))))
-
-#define EXPAND_HEAP(ptr, expsize) \
-    do { \
-        extend_heap(TRICK_CHUNKSIZE(expsize) / WSIZE); \
-        remainsize = GET_SIZE(HDRP(NEXT_BLKP(ptr))); \
-    } while (0)
-
 /* 堆的头指针 */
 static void *heap_listp;
 
@@ -306,33 +289,38 @@ void *mm_realloc(void *ptr, size_t size)
     /* 情况：大小变大 */
     else {
         int enough_size = remainsize >= expsize + OVERHEAD; /* 剩余大小是否足够 */
+        int can_expand = (remainsize && !GET_SIZE(HDRP(NEXT_BLKP(NEXT_BLKP(ptr))))) || !GET_SIZE(HDRP(NEXT_BLKP(ptr))); /* 块是否可以扩展 */
 
-    /* 子情况：剩余大小不足，但可以简单地扩展到堆的末尾 */
-    if (!enough_size && CAN_EXPAND(ptr, expsize)) {
-        EXPAND_HEAP(ptr, expsize);
-    }
-    /* 子情况：剩余大小足够 */
-    if (enough_size || CAN_EXPAND(ptr, expsize)) {
-        rm_fb(NEXT_BLKP(ptr));
-        SET_BLOCK(ptr, newsize, 1);
-        if (remainsize != expsize) {
-            SET_BLOCK(NEXT_BLKP(ptr), remainsize - expsize, 0);
-            ins_fb(NEXT_BLKP(ptr));
-
-            latest_fb = NEXT_BLKP(ptr);
+        /* 子情况：剩余大小不足，但可以简单地扩展到堆的末尾 */
+        if (!enough_size && can_expand) {
+            // extend_heap((expsize >= CHUNKSIZE ? expsize : CHUNKSIZE) / WSIZE);
+            extend_heap(TRICK_CHUNKSIZE(expsize) / WSIZE);
+            remainsize = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
         }
-        return ptr;
-    }
-    /* 子情况：需要重新分配新的内存块 */
-    else {
-        void *newptr = mm_malloc(size);
-        if (newptr == NULL)
-            return NULL;
-        memcpy(newptr, ptr, oldsize - DSIZE);
-        mm_free(ptr);
+        /* 子情况：剩余大小足够 */
+        if (enough_size || can_expand) {
+            rm_fb(NEXT_BLKP(ptr));
+            PUT(HDRP(ptr), PACK(newsize, 1));
+            PUT(FTRP(ptr), PACK(newsize, 1));
+            if (remainsize != expsize) {
+                PUT(HDRP(NEXT_BLKP(ptr)), PACK(remainsize - expsize, 0));
+                PUT(FTRP(NEXT_BLKP(ptr)), PACK(remainsize - expsize, 0));
+                ins_fb(NEXT_BLKP(ptr));
 
-        return newptr;
-    }
+                latest_fb = NEXT_BLKP(ptr);
+            }
+            return ptr;
+        }
+        /* 子情况：需要重新分配新的内存块 */
+        else {
+            void *newptr = mm_malloc(size);
+            if (newptr == NULL)
+                return NULL;
+            memcpy(newptr, ptr, oldsize - DSIZE);
+            mm_free(ptr);
+
+            return newptr;
+        }
     }
 }
 
