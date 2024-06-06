@@ -1,0 +1,409 @@
+/*
+ * proxy.c - ICS Web proxy
+ *
+ *
+ */
+
+#include <stdarg.h>
+#include <sys/select.h>
+
+#include "csapp.h"
+
+/*
+ * Function prototypes
+ */
+int parse_uri(char* uri, char* target_addr, char* path, char* port);
+void format_log_entry(char* logstring, struct sockaddr_in* sockaddr, char* uri,
+                      size_t size);
+void* thread_routine(void* thread_arg);
+void proxy_manager(int connfd, struct sockaddr_in* clientaddr);
+int proxy_send(int clientfd, rio_t* conn_rio, char* req_header, size_t length,
+               char* method);
+size_t proxy_receive(int connfd, rio_t* client_rio);
+ssize_t Rio_readnb_w(rio_t* rp, void* usrbuf, size_t n);
+ssize_t Rio_readlineb_w(rio_t* rp, void* usrbuf, size_t maxlen);
+int Rio_writen_w(int fd, void* usrbuf, size_t n);
+
+/*
+ * Global variable
+ */
+sem_t log_mutex;
+
+/*
+ * Struct for thread arguments
+ */
+struct arg_t {
+  int connfd;
+  struct sockaddr_in clientaddr;
+};
+
+/*
+ * main - Main routine for the proxy program
+ */
+int main(int argc, char** argv) {
+  /* Check arguments */
+  if (argc != 2) {
+    fprintf(stderr, "Usage: %s <port number>\n", argv[0]);
+    exit(0);
+  }
+
+  //调用 Open_listenfd 函数，创建监听套接字，用于在指定端口 argv[1]
+  //上监听传入的连接
+  int listenfd = Open_listenfd(argv[1]);
+  //定义 clientlen，并初始化为 sockaddr_in
+  //结构体的大小，用于存储客户端地址的长度
+  socklen_t clientlen = sizeof(struct sockaddr_in);
+  //定义一个 pthread_t 类型的变量 tid，用于存储线程标识符
+  pthread_t tid;
+  //定义一个指向 arg_t 结构体的指针 thread_arg，用于存储传递给线程的参数
+  struct arg_t* thread_arg;
+  //初始化信号量 log_mutex，初始值为1，表示这是一个用于保护日志写操作的互斥锁
+  Sem_init(&log_mutex, 0, 1);
+  //忽略 SIGPIPE 信号。SIGPIPE
+  //信号在写入已关闭的套接字时会被触发，忽略它可以防止程序因客户端断开连接而崩溃
+  Signal(SIGPIPE, SIG_IGN);
+
+  //进入一个无限循环，持续监听和处理客户端连接
+  while (1) {
+    //动态分配内存给 thread_arg，用于存储传递给线程的参数
+    thread_arg = Malloc(sizeof(struct arg_t));
+    //调用 Accept
+    //函数，接受一个客户端连接，返回一个新的连接文件描述符，并将客户端地址存储在
+    // thread_arg->clientaddr 中 Accept 函数： Accept
+    // 是一个系统调用，用于从已连接的队列中取出第一个连接请求并返回一个新的连接文件描述符。
+    // Accept 函数的签名是 int Accept(int sockfd, struct sockaddr *addr,
+    // socklen_t *addrlen)。 参数解释： listenfd：监听套接字文件描述符，这是在
+    // main 函数开头通过 Open_listenfd 函数创建的，代表服务器正在监听的套接字。
+    //(SA*)&(thread_arg->clientaddr)：
+    // SA 是 struct sockaddr 的别名。
+    //&(thread_arg->clientaddr) 是一个指向 thread_arg 结构体中 clientaddr
+    //字段的指针，clientaddr 是一个 sockaddr_in 结构体，存储客户端的地址信息。
+    //(SA*)&(thread_arg->clientaddr) 将 clientaddr 的指针强制转换为 struct
+    // sockaddr 类型的指针，因为 Accept 函数需要 struct sockaddr
+    // 类型的地址参数。 &clientlen：指向存储地址长度的变量的指针，clientlen
+    //初始化为 sizeof(struct sockaddr_in)，表示 clientaddr 结构体的大小。Accept
+    // 函数会更新 clientlen，以反映实际返回的地址长度。 返回值： Accept
+    // 函数返回一个新的连接文件描述符，代表与客户端的新连接，并将该值赋给
+    // thread_arg->connfd。 thread_arg->connfd
+    // 将包含新连接的文件描述符，用于与客户端通信。
+    struct sockaddr* addr = (SA*)&(thread_arg->clientaddr);
+    thread_arg->connfd = Accept(listenfd, addr, &clientlen);
+    //创建一个新线程，执行 thread_routine 函数，并将 thread_arg
+    //作为参数传递给该线程 Pthread_create 函数： Pthread_create
+    // 是一个用于创建新线程的函数。 函数签名是 int pthread_create(pthread_t
+    //*thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void
+    //*arg)。 参数解释： &tid：指向 pthread_t 变量 tid
+    //的指针，用于存储新创建线程的标识符。 NULL：线程属性参数，传递 NULL
+    // 表示使用默认线程属性。
+    //&thread_routine：线程启动例程的函数指针，即新线程将执行的函数。在这里是
+    // thread_routine 函数。 thread_arg：传递给新线程的参数。在这里是指向 arg_t
+    // 结构体的指针 thread_arg，包含新连接的文件描述符和客户端地址。 功能：
+    // Pthread_create 函数创建一个新线程，执行 thread_routine 函数，并将
+    // thread_arg 作为参数传递给该线程。 新线程开始执行时，将调用 thread_routine
+    //函数，并使用 thread_arg 作为其参数。
+    Pthread_create(&tid, NULL, &thread_routine, thread_arg);
+  }
+}
+
+//这是一个线程例程，所有新创建的线程都会运行这个函数
+void* thread_routine(void* thread_arg) {
+  // Pthread_detach 用于将当前线程设置为分离状态。
+  //分离状态的线程在结束时会自动释放资源，而无需其他线程调用 pthread_join
+  Pthread_detach(Pthread_self());
+
+  //将传递给线程的参数 thread_arg 强制转换为 arg_t 结构体指针类型
+  struct arg_t* arg_self = (struct arg_t*)thread_arg;
+  // proxy_manager 是代理服务器的主要处理函数，负责管理请求和响应。
+  // proxy_manager 函数使用 arg_self->connfd（客户端连接文件描述符）和
+  // arg_self->clientaddr（客户端地址）进行处理 proxy_manager 函数：
+  // proxy_manager 是代理服务器的主要处理函数，负责处理客户端的请求和响应。
+  //函数原型为 void proxy_manager(int connfd, struct sockaddr_in* clientaddr)。
+  //参数传递：
+  // arg_self->connfd：访问 arg_self 结构体中的 connfd 成员，这个成员是一个 int
+  // 类型，代表客户端连接的文件描述符。该文件描述符用于与客户端通信。
+  //&(arg_self->clientaddr)：访问 arg_self 结构体中的 clientaddr
+  //成员，并获取它的地址。clientaddr 是一个 struct sockaddr_in
+  //类型，存储客户端的地址信息。传递地址是因为 proxy_manager 函数需要一个指向
+  // struct sockaddr_in 的指针。
+  proxy_manager(arg_self->connfd, &(arg_self->clientaddr));
+
+  //关闭与客户端的连接。
+  Close(arg_self->connfd);
+  //释放为 arg_self 动态分配的内存，避免内存泄漏
+  Free(arg_self);
+  //返回 NULL，表示线程已结束
+  return NULL;
+}
+
+//代理服务器的主要处理函数，负责管理请求和响应。
+void proxy_manager(int connfd, struct sockaddr_in* clientaddr) {
+  // buf, req_header 用于存储请求和响应数据。
+  char buf[MAXLINE], req_header[MAXLINE * 2];
+  // method, uri, version 用于解析请求行。
+  char method[MAXLINE / 4], uri[MAXLINE], version[MAXLINE / 2];
+  // hostname, pathname, port 用于解析 URI。
+  char hostname[MAXLINE], pathname[MAXLINE], port[MAXLINE];
+  // clientfd 是与目标服务器的连接文件描述符。
+  int clientfd;
+  // conn_rio, client_rio 是 Rio 库的缓冲区。
+  rio_t conn_rio, client_rio;
+  // byte_size, content_length 用于计算数据大小。
+  size_t byte_size = 0, content_length = 0;
+
+  //初始化 conn_rio 以便从 connfd 读取数据。
+  Rio_readinitb(&conn_rio, connfd);
+  //从 connfd 读取一行数据到 buf。
+  if (!Rio_readlineb_w(&conn_rio, buf, MAXLINE)) {
+    //如果读取失败，打印错误信息并返回。
+    fprintf(stderr, "error: read empty request line\n");
+    return;
+  }
+  //从 buf 中解析请求行，获取 method, uri, version。
+  if (sscanf(buf, "%s %s %s", method, uri, version) < 3) {
+    //如果解析失败，打印错误信息并返回。
+    fprintf(stderr, "error: mismatched parameters\n");
+    return;
+  }
+  //解析 URI 以获取 hostname, pathname, port。
+  if (parse_uri(uri, hostname, pathname, port) != 0) {
+    //如果解析失败，打印错误信息并返回。
+    fprintf(stderr, "error: parse uri error\n");
+    return;
+  }
+
+  //设置请求头。
+  sprintf(req_header, "%s /%s %s\r\n", method, pathname, version);
+  //从 conn_rio 中读取一行数据到 buf。
+  size_t n = Rio_readlineb_w(&conn_rio, buf, MAXLINE);
+  //用于存储临时请求头。
+  char tmp_header[MAXLINE];
+  //循环读取请求头，直到遇到空行。
+  while (n != 0) {
+    //如果 buf 中包含 "Content-Length"，则将内容长度存储到 content_length 中。
+    if (strncasecmp(buf, "Content-Length", 14) == 0) {
+      //将内容长度存储到 content_length 中。
+      sscanf(buf + 15, "%zu", &content_length);
+    }
+    //将请求头存储到 tmp_header 中。
+    strcpy(tmp_header, req_header);
+    //将 buf 追加到请求头中。
+    sprintf(req_header, "%s%s", tmp_header, buf);
+    //如果 buf 中包含空行，则跳出循环。
+    if (strncmp(buf, "\r\n", 2) == 0) break;
+    //从 conn_rio 中读取一行数据到 buf。
+    n = Rio_readlineb_w(&conn_rio, buf, MAXLINE);
+  }
+  //如果没有内容，返回。
+  if (n == 0) {
+    return;
+  }
+  //打开与目标服务器的连接。
+  clientfd = open_clientfd(hostname, port);
+  //如果打开失败，打印错误信息并返回。
+  if (clientfd < 0) {
+    //打印错误信息。
+    fprintf(stderr, "error: open client fd error (hostname: %s, port: %s)\n",
+            hostname, port);
+    return;
+  }
+  //初始化 client_rio 以便从 clientfd 读取数据。
+  Rio_readinitb(&client_rio, clientfd);
+  //发送请求到服务器。
+  if (proxy_send(clientfd, &conn_rio, req_header, content_length, method) ==
+      0) {
+    //接收响应。
+    byte_size = proxy_receive(connfd, &client_rio);
+  }
+
+  //格式化日志。
+  format_log_entry(buf, clientaddr, uri, byte_size);
+  //获取互斥锁 log_mutex 的锁。
+  P(&log_mutex);
+  //打印日志。
+  printf("%s\n", buf);
+  //释放互斥锁 log_mutex 的锁。
+  V(&log_mutex);
+
+  //关闭与目标服务器的连接。
+  Close(clientfd);
+}
+
+//发送请求到服务器。
+int proxy_send(int clientfd, rio_t* conn_rio, char* req_header, size_t length,
+               char* method) {
+  // buf 用于存储数据。
+  char buf[MAXLINE];
+
+  //写入请求头。
+  if (Rio_writen_w(clientfd, req_header, strlen(req_header)) == -1) {
+    return -1;
+  }
+  //如果方法不是 GET，则写入请求体。
+  if (strcasecmp(method, "GET") != 0) {
+    //循环写入请求体。
+    for (int i = 0; i < length; ++i) {
+      //从 conn_rio 中读取一字节数据到 buf。
+      if (Rio_readnb_w(conn_rio, buf, 1) == 0) return -1;
+      //将 buf 写入到 clientfd。
+      if (Rio_writen_w(clientfd, buf, 1) == -1) return -1;
+    }
+  }
+
+  return 0;
+}
+
+//接收响应。
+size_t proxy_receive(int connfd, rio_t* client_rio) {
+  // buf 用于存储数据。
+  char buf[MAXLINE];
+  // byte_size, content_length 用于计算数据大小。
+  size_t byte_size = 0, content_length = 0;
+
+  //获取响应头。
+  size_t n = Rio_readlineb_w(client_rio, buf, MAXLINE);
+  //循环读取响应头，直到遇到空行。
+  while (n != 0) {
+    //将读取的字节数添加到 byte_size 中。
+    byte_size += n;
+    //如果 buf 中包含 "Content-Length"，则将内容长度存储到 content_length 中。
+    if (strncasecmp(buf, "Content-Length", 14) == 0) {
+      //将内容长度存储到 content_length 中。
+      sscanf(buf + 15, "%zu", &content_length);
+    }
+    //将 buf 写入到 connfd。
+    if (Rio_writen_w(connfd, buf, strlen(buf)) == -1) {
+      return 0;
+    }
+    //如果 buf 中包含空行，则跳出循环。
+    if (strncmp(buf, "\r\n", 2) == 0) break;
+    //从 client_rio 中读取一行数据到 buf。
+    n = Rio_readlineb_w(client_rio, buf, MAXLINE);
+  }
+  //如果没有内容，返回。
+  if (n == 0) {
+    return 0;
+  }
+
+  //获取响应体。
+  for (int i = 0; i < content_length; ++i) {
+    //从 client_rio 中读取一字节数据到 buf。
+    if (Rio_readnb_w(client_rio, buf, 1) == 0) return 0;
+    //将 buf 写入到 connfd。
+    if (Rio_writen_w(connfd, buf, 1) == -1) return 0;
+    //将读取的字节数添加到 byte_size 中。
+    ++byte_size;
+  }
+  //返回读取的字节数。
+  return byte_size;
+}
+
+/*
+ * parse_uri - URI parser
+ *
+ * Given a URI from an HTTP proxy GET request (i.e., a URL), extract
+ * the host name, path name, and port.  The memory for hostname and
+ * pathname must already be allocated and should be at least MAXLINE
+ * bytes. Return -1 if there are any problems.
+ */
+int parse_uri(char* uri, char* hostname, char* pathname, char* port) {
+  char* hostbegin;
+  char* hostend;
+  char* pathbegin;
+  int len;
+
+  if (strncasecmp(uri, "http://", 7) != 0) {
+    hostname[0] = '\0';
+    return -1;
+  }
+
+  /* Extract the host name */
+  hostbegin = uri + 7;
+  hostend = strpbrk(hostbegin, " :/\r\n\0");
+  if (hostend == NULL) return -1;
+  len = hostend - hostbegin;
+  strncpy(hostname, hostbegin, len);
+  hostname[len] = '\0';
+
+  /* Extract the port number */
+  if (*hostend == ':') {
+    char* p = hostend + 1;
+    while (isdigit(*p)) *port++ = *p++;
+    *port = '\0';
+  } else {
+    strcpy(port, "80");
+  }
+
+  /* Extract the path */
+  pathbegin = strchr(hostbegin, '/');
+  if (pathbegin == NULL) {
+    pathname[0] = '\0';
+  } else {
+    pathbegin++;
+    strcpy(pathname, pathbegin);
+  }
+
+  return 0;
+}
+
+/*
+ * format_log_entry - Create a formatted log entry in logstring.
+ *
+ * The inputs are the socket address of the requesting client
+ * (sockaddr), the URI from the request (uri), the number of bytes
+ * from the server (size).
+ */
+void format_log_entry(char* logstring, struct sockaddr_in* sockaddr, char* uri,
+                      size_t size) {
+  time_t now;
+  char time_str[MAXLINE];
+  char host[INET_ADDRSTRLEN];
+
+  /* Get a formatted time string */
+  now = time(NULL);
+  strftime(time_str, MAXLINE, "%a %d %b %Y %H:%M:%S %Z", localtime(&now));
+
+  if (inet_ntop(AF_INET, &sockaddr->sin_addr, host, sizeof(host)) == NULL)
+    unix_error("Convert sockaddr_in to string representation failed\n");
+
+  /* Return the formatted log entry string */
+  sprintf(logstring, "%s: %s %s %zu", time_str, host, uri, size);
+}
+
+// Rio 库的错误检查包装函数。
+ssize_t Rio_readnb_w(rio_t* rp, void* usrbuf, size_t n) {
+  // rc 用于存储读取的字节数。
+  ssize_t rc;
+  //从 rio_t 结构体中读取 n 字节数据到 usrbuf。
+  if ((rc = rio_readnb(rp, usrbuf, n)) < 0) {
+    //如果读取失败，打印错误信息并返回 0。
+    fprintf(stderr, "Rio_readnb error\n");
+    return 0;
+  }
+  //返回读取的字节数。
+  return rc;
+}
+
+// Rio 库的错误检查包装函数。
+ssize_t Rio_readlineb_w(rio_t* rp, void* usrbuf, size_t maxlen) {
+  // rc 用于存储读取的字节数。
+  ssize_t rc;
+  //从 rio_t 结构体中读取一行数据到 usrbuf。
+  if ((rc = rio_readlineb(rp, usrbuf, maxlen)) < 0) {
+    //如果读取失败，打印错误信息并返回 0。
+    fprintf(stderr, "Rio_readlineb error\n");
+    return 0;
+  }
+  //返回读取的字节数。
+  return rc;
+}
+
+// Rio 库的错误检查包装函数。
+int Rio_writen_w(int fd, void* usrbuf, size_t n) {
+  //如果写入失败，打印错误信息并返回 -1。
+  if (rio_writen(fd, usrbuf, n) != n) {
+    //如果写入失败，打印错误信息并返回 -1。
+    fprintf(stderr, "Rio_writen error\n");
+    return -1;
+  }
+  return 0;
+}
